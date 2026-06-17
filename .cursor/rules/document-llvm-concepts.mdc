@@ -1,0 +1,13 @@
+---
+description: 用户提问 LLVM/MLIR 代码概念时，将回答写入对应的 markdown 文档
+alwaysApply: true
+---
+
+# Document LLVM/MLIR Concepts in Markdown
+
+当用户在 Triton 项目的上下文中提问 LLVM/MLIR 代码概念（如 canonicalization pattern、pass、dialect、IR 结构等）时：
+
+1. **先回答** — 用中文解释该概念是什么、干什么用、为什么这么设计
+2. **同时写入 markdown** — 将解释内容追加到与该概念最相关的 markdown 文档中（通常在 `markdowns/` 目录下）
+3. **定位到正确位置** — 放在对应 pass/功能章节下，作为一个独立的子章节（如 `#### Canonicalization Pattern 是什么`）
+4. **善用表格和 IR 示例** — 用表格对比 Before/After，用 IR 代码片段展示实际变换效果

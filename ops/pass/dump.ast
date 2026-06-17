@@ -1,0 +1,78 @@
+FunctionDef(
+  name='inline_coalesced_kernel',
+  args=arguments(
+    posonlyargs=[],
+    args=[
+      arg(arg='in_ptr'),
+      arg(arg='out_ptr'),
+      arg(arg='numel'),
+      arg(
+        arg='BLOCK',
+        annotation=Attribute(
+          value=Name(id='gl', ctx=Load()),
+          attr='constexpr',
+          ctx=Load()))],
+    kwonlyargs=[],
+    kw_defaults=[],
+    defaults=[]),
+  body=[
+    Assign(
+      targets=[
+        Name(id='pid', ctx=Store())],
+      value=Call(
+        func=Attribute(
+          value=Name(id='gl', ctx=Load()),
+          attr='program_id',
+          ctx=Load()),
+        args=[
+          Constant(value=0)],
+        keywords=[])),
+    Assign(
+      targets=[
+        Tuple(
+          elts=[
+            Name(id='offsets', ctx=Store()),
+            Name(id='mask', ctx=Store())],
+          ctx=Store())],
+      value=Call(
+        func=Name(id='get_offsets_and_mask', ctx=Load()),
+        args=[
+          Name(id='pid', ctx=Load()),
+          Name(id='numel', ctx=Load()),
+          Name(id='BLOCK', ctx=Load())],
+        keywords=[])),
+    Assign(
+      targets=[
+        Name(id='value', ctx=Store())],
+      value=Call(
+        func=Attribute(
+          value=Name(id='gl', ctx=Load()),
+          attr='load',
+          ctx=Load()),
+        args=[
+          BinOp(
+            left=Name(id='in_ptr', ctx=Load()),
+            op=Add(),
+            right=Name(id='offsets', ctx=Load()))],
+        keywords=[
+          keyword(
+            arg='mask',
+            value=Name(id='mask', ctx=Load()))])),
+    Expr(
+      value=Call(
+        func=Attribute(
+          value=Name(id='gl', ctx=Load()),
+          attr='store',
+          ctx=Load()),
+        args=[
+          BinOp(
+            left=Name(id='out_ptr', ctx=Load()),
+            op=Add(),
+            right=Name(id='offsets', ctx=Load())),
+          Name(id='value', ctx=Load())],
+        keywords=[
+          keyword(
+            arg='mask',
+            value=Name(id='mask', ctx=Load()))]))],
+  decorator_list=[],
+  type_params=[])

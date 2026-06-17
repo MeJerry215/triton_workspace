@@ -1,0 +1,20 @@
+---
+description: Use the triton conda environment for shell commands and Python
+alwaysApply: true
+---
+
+# Conda Environment
+
+This project uses the `triton` conda environment. Before running Python scripts, tests, benchmarks, or other commands that depend on project dependencies (torch, triton, etc.), activate it:
+
+```bash
+conda activate triton
+```
+
+When using the Shell tool, prefix commands with conda activation and the local Triton source path:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate triton && PYTHONPATH=/root/triton_workspace/triton/python <your command>
+```
+
+If a command fails with `ModuleNotFoundError` (e.g. missing `torch`), retry after activating the `triton` environment.
