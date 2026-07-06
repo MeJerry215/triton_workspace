@@ -473,17 +473,208 @@ return mod
 
 ---
 
-## 5) `gluon_to_ttgir` vs `make_ttgir`
+## 5) `gluon_to_ttgir` vs `make_ttgir` — 完整对比
+
+### 5.1 全局视角：两条路径走向 LLVM IR
+
+```
+                   传统 Triton                              Gluon
+                  ────────────                           ──────────
+
+  source    @triton.jit kernel                    @gluon.jit kernel
+                │                                        │
+                ▼                                        ▼
+  make_ttir    7 个 pass (无 layout)               不存在
+                │                                        │
+                ▼                                        ▼
+  ttgir      ┌───────────────────┐               ┌────────────────────┐
+  stage      │  make_ttgir       │               │  gluon_to_ttgir    │
+             │  ~38 个 pass      │               │  9 个 pass         │
+             │  layout 密集型    │               │  layout 解析为主   │
+             └────────┬──────────┘               └─────────┬──────────┘
+                      │                                     │
+                      ▼                                     ▼
+  llir      ┌──────────────────────────────────────────────────────┐
+  stage     │  make_llir (共享代码, ~15 个 pass)                   │
+            │  内存分配 + TTGIR → LLVM IR 降级                     │
+            └──────────────────────────┬───────────────────────────┘
+                                       ▼
+                                   PTX / cubin
+```
+
+**两条路径在 `make_llir` 汇合。** `gluon_to_ttgir` 的输出与 `make_ttgir` 的输出是**同一级别的 IR**——都是带 concrete TTGPUIR layout 的 MLIR module，后续 `make_llir` 是共享的。
+
+### 5.2 为什么 Gluon 不需要那 30+ 个 pass？
+
+核心原因：**layout 信息的来源不同**。
+
+#### 传统路径：layout 由编译器"猜"
+
+```
+TTIR (无 layout)
+  %x = ... : tensor<128xf32>
+  %y = ... : tensor<128xf32>
+  %z = arith.addf %x, %y : tensor<128xf32>
+
+       │
+       ▼  convert_to_ttgpuir — 首次插入 layout
+       │  保守选择：所有 tensor 先用 #blocked 默认 layout
+
+TTGPUIR (有 layout，但朴素)
+  %x = ... : tensor<128xf32, #blocked<{sizePerThread=[1], threadsPerWarp=[32]}>>
+  %y = ... : tensor<128xf32, #blocked<{sizePerThread=[1], ...}>>
+  %z = ... : tensor<128xf32, #blocked<{...}>>
+
+       │
+       ▼  ~30+ 个优化 pass
+          coalesce            — 分析访存 pattern，优化 load/store 的 layout
+          remove_layout       — 消除冗余 layout 转换
+          accelerate_matmul   — 为 dot op 选 MMA-compatible layout
+          optimize_thread_loc — 改善线程局部性
+          optimize_dot_operand— 匹配 dot 操作数 layout
+          pipeline            — 插入软件流水线
+          warp_specialize     — warp 特化
+          ...
+
+       ▼
+  最终 TTGPUIR (layout 已被优化)
+```
+
+传统路径的 pass 序列本质上是在**猜测**什么 layout 好。它们通过分析访存模式、matmul 语义、数据依赖关系来反复调整 layout，并在每次调整后通过 `remove_layout_conversions` 清理不一致。这个过程是**迭代式、启发式**的——如果猜错了，可能产生大量冗余的 `convert_layout` 操作。
+
+#### Gluon 路径：layout 由用户/语义指定
+
+```
+Gluon MLIR (自带 encoding)
+  %x = ... : tensor<128xf32, #gluon.auto_encoding>
+  %y = ... : tensor<128xf32, #gluon.auto_encoding>
+  %z = arith.addf %x, %y : tensor<128xf32, #gluon.auto_encoding>
+
+       │
+       ▼  infer_coalesced_encodings — 从 gmem 访存取 seed
+       ▼  resolve_auto_encodings    — 从 set_auto_layout 取 seed
+       │  沿 def-use 传播 concrete layout
+
+TTGPUIR (layout 已确定)
+  %x = ... : tensor<128xf32, #blocked<{...}>>
+  %y = ... : tensor<128xf32, #blocked<{...}>>
+  %z = ... : tensor<128xf32, #blocked<{...}>>
+
+       │
+       ▼  仅 9 个 pass，且大多是轻量清理
+          gluon-canonicalize  — 排除 layout pattern 的保守清理
+          SCCP                — 常量传播
+          loop-aware-cse      — 公共子表达式消除
+          gluon-canonicalize  — 第二次清理
+          combine-select-if   — 控制流 peephole
+```
+
+Gluon 的核心假设：**layout 是 kernel 性能最关键的决定因素之一，应该由程序员（或高级语义）显式控制，而不是留给编译器猜测。** 所以：
+
+- **用户手写**的部分（smem layout、MMA layout、dot operand layout）直接就是 concrete encoding，不需要推断
+- **用户标注 `CoalescedLayout()`** 的部分，编译器用与 Triton `coalesce` 相同的算法算出 concrete `#blocked`
+- **用户标注 `AutoLayout()`** 的部分，编译器从周围的 concrete anchor 传播过去
+- **没有反复迭代**——一次固定点传播就收敛，不产生额外的 `convert_layout` 操作
+
+### 5.3 pass 数量逐项对比 (NVIDIA backend, SM90)
+
+| # | `make_ttgir` (传统) | # | `gluon_to_ttgir` (Gluon) |
+|---|---------------------|---|--------------------------|
+| 1 | `convert_to_ttgpuir` ← 首次插入 layout | 1 | `gluon-inline` |
+| 2 | `coalesce` | 2 | `gluon-infer-coalesced-encodings` |
+| 3 | `f32_dot_tc` | 3 | `gluon-resolve-auto-encodings` |
+| 4 | `plan_cta` | 4 | `tma_lowering` |
+| 5 | `remove_layout_conversions` | 5 | `gluon-canonicalize` |
+| 6 | `optimize_thread_locality` | 6 | `sccp` |
+| 7 | `accelerate_matmul` | 7 | `loop-aware-cse` |
+| 8 | `remove_layout_conversions` | 8 | `gluon-canonicalize` |
+| 9 | `optimize_dot_operands` | 9 | `combine-tensor-select-and-if` |
+| 10 | `optimize_descriptor_encoding` | | **共 9 个 pass** |
+| 11 | `loop-aware-cse` | | |
+| 12 | `fuse_nested_loops` | | |
+| 13 | `canonicalizer` | | |
+| 14 | `triton_licm` | | |
+| 15 | `canonicalizer` | | |
+| 16 | `combine-tensor-select-and-if` | | |
+| 17 | `hopper_warpspec` | | |
+| 18 | `assign_latencies` | | |
+| 19 | `schedule_loops` | | |
+| 20 | `pipeline` | | |
+| 21 | `canonicalizer` | | |
+| 22 | `loop-aware-cse` | | |
+| 23 | `prefetch` | | |
+| 24 | `optimize_dot_operands` | | |
+| 25 | `coalesce_async_copy` | | |
+| 26 | `optimize_tmem_layouts` | | |
+| 27 | `tma_lowering` | | |
+| 28 | `remove_layout_conversions` | | |
+| 29 | `interleave_tmem` | | |
+| 30 | `reduce_data_duplication` | | |
+| 31 | `reorder_instructions` | | |
+| 32 | `loop-aware-cse` | | |
+| 33 | `symbol_dce` | | |
+| 34 | `fence_insertion` | | |
+| 35 | `lower_mma` | | |
+| 36 | `sccp` | | |
+| 37 | `cse` | | |
+| 38 | `canonicalizer` | | |
+| | **共 38 个 pass** | | |
+
+> 注：`make_ttgir` 中 SM90 分支有 38 个 pass；SM100+ 分支略有不同（比如有 warp-specialize、hoist-tmem-alloc），但数量级相同。
+
+**Gluon 省掉的是 `make_ttgir` 中那 38 个 pass 里的约 30 个 layout 优化 pass。** 省掉的核心原因就是 encoding 属性让 layout 从"编译器猜测"变成了"用户/语义指定"。
+
+### 5.4 对比总表
 
 | 维度 | `make_ttgir`（Triton） | `gluon_to_ttgir`（Gluon） |
 |------|------------------------|---------------------------|
-| 输入 | 经 `make_ttir` 清洗的 TTIR | 前端直接 emit 的 Gluon/TTGPUIR MLIR |
-| TTIR→TTGPUIR | `convert_to_ttgpuir` | 不需要 |
-| Layout 来源 | 编译器 pass 推断（coalesce 等） | 用户 Python 显式指定 + Gluon pass 解析 Auto/Coalesced |
-| 主要优化 | coalesce、matmul、pipeline、warp spec、tmem/tma… | 以 layout 解析为主，优化 pass 极少 |
-| 适用场景 | 常规 Triton kernel | 需精细控制 smem/layout/MMA 的高性能 kernel（如 FA、GQA） |
+| **输入** | 经 `make_ttir` 清洗的 TTIR（无 layout） | 前端直接 emit 的 Gluon/TTGPUIR MLIR（带 encoding） |
+| **TTIR→TTGPUIR** | `convert_to_ttgpuir`（从零插入 layout） | 不需要——encoding 已就位 |
+| **Layout 来源** | 编译器 pass 反复猜测+迭代 | 用户手写 + Auto/Coalesced 传播一次收敛 |
+| **核心 pass 序列** | 38 个 pass（SM90 分支） | 9 个 pass |
+| **layout 转换消除** | `remove_layout_conversions` 反复清理 | encoding 传播本身就是一致的，极少产生 `convert_layout` |
+| **适用场景** | 常规 Triton kernel，编译器全权负责 layout | 需精细控制 smem/layout/MMA 的高性能 kernel（如 FA、GQA） |
+| **后续 stage** | `make_llir`（15 个 pass） | 同一份 `make_llir` |
+| **到 LLVM IR 的总 pass** | `make_ttir`(7) + `make_ttgir`(38) + `make_llir`(15) = **~60** | `gluon_to_ttgir`(9) + `make_llir`(15) = **~24** |
 
-Gluon 的设计假设：**性能关键 layout 决策由用户在 Python 层完成**，编译器只做合法性校验、Auto/Coalesced 补全和必要 lowering，而非重新跑一遍 Triton 的全套 GPU 优化。
+### 5.5 但 `make_llir` 没有省掉
+
+需要澄清一点：**Gluon 的输出仍然是 TTGPUIR，不是 LLVM IR。** `make_llir` 是两条路径共享的，都要做：
+
+```
+make_llir (共享, ~15 个 pass):
+  ├─ combine_tensor_select_and_if    清理
+  ├─ allocate_warp_groups            分配 warp group
+  ├─ scf_to_cf                        结构化→非结构化控制流
+  ├─ allocate_shared_memory           共享内存分配
+  ├─ allocate_tensor_memory           tensor 内存分配
+  ├─ allocate_global_scratch_memory   全局 scratch 分配
+  ├─ to_llvmir                        TTGIR → LLVM IR 降级
+  ├─ nvgpu_to_llvm / nvvm_to_llvm    GPU 方言 → LLVM 方言
+  ├─ canonicalizer / CSE / symbol_dce 清理
+  └─ ... → LLVM IR → PTX → cubin
+```
+
+所以从 Triton/Gluon 源码到最终 PTX 的总 pass 数：
+- **Triton**: `make_ttir` (7) + `make_ttgir` (~38) + `make_llir` (~15) = **~60 个 pass**
+- **Gluon**: `gluon_to_ttgir` (9) + `make_llir` (~15) = **~24 个 pass**
+
+Gluon 省掉的是 `make_ttir` 和 `make_ttgir` 中的 **~46 个 pass**，但 `make_llir` 的 15 个 pass 是跑不掉的。
+
+### 5.6 设计哲学总结
+
+```
+传统 Triton:                Gluon:
+"编译器是最懂 GPU 的"      "程序员更懂自己的 kernel"
+         │                           │
+         ▼                           ▼
+  Layout 由编译器猜测          Layout 由程序员指定
+  多 pass 迭代收敛             单次传播即确定
+  适用通用场景                 适用性能关键场景
+  38 个 pass 优化              9 个 pass 解析+清理
+```
+
+Gluon 的设计假设：**性能关键 layout 决策由用户在 Python 层完成**，编译器只做合法性校验、Auto/Coalesced 补全和必要 lowering，而非重新跑一遍 Triton 的全套 GPU 优化。这是为什么 `gluon_to_ttgir` 能以 9 个 pass 达到与 `make_ttgir` 38 个 pass 同级的 IR 质量。
 
 ---
 

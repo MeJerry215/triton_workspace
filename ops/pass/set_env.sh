@@ -2,8 +2,8 @@
 
 source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate triton
 
-# 脚本所在目录（兼容 git clone 到任意位置）
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+# 脚本所在目录（兼容 source 和直接执行两种方式，也兼容 git clone 到任意位置）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
 
 export PYTHONPATH="$(cd "$SCRIPT_DIR/../../triton/python" && pwd -P)"
 

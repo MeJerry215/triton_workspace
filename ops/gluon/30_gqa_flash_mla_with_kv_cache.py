@@ -535,8 +535,8 @@ def gqa_flash_mla_sparse_fa_gluon_kernel(q_ptr, k_cache_ptr, indices_ptr, topk_l
     d_offsets = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, q_layout))
     d_offsets_k = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(1, k_layout))
     v_offsets = gl.arange(0, D_V, layout=gl.SliceLayout(0, v_layout))
-    q_smem = gl.allocate_shared_memory(elem_ty, [BLOCK_H, BLOCK_D], layout=q_smem_layout)
-    k_smem = gl.allocate_shared_memory(elem_ty, [BLOCK_D, GROUP_SIZE], layout=k_smem_layout)
+    q_smem = gl.allocate_shared_memory(elem_ty, [2, BLOCK_H, BLOCK_D], layout=q_smem_layout)
+    k_smem = gl.allocate_shared_memory(elem_ty, [2, BLOCK_D, GROUP_SIZE], layout=k_smem_layout)
     v_smem = gl.allocate_shared_memory(elem_ty, [GROUP_SIZE, D_V], layout=v_smem_layout)
     scores_smem = gl.allocate_shared_memory(gl.float32, [BLOCK_H, GROUP_SIZE], layout=f32_smem_layout)
     acc_smem = gl.allocate_shared_memory(gl.float32, [BLOCK_H, D_V], layout=f32_smem_layout)
@@ -560,23 +560,44 @@ def gqa_flash_mla_sparse_fa_gluon_kernel(q_ptr, k_cache_ptr, indices_ptr, topk_l
         kv_block_idx = safe_idx // PAGE_BLOCK_SIZE
         kv_pos = safe_idx - kv_block_idx * PAGE_BLOCK_SIZE
         scores_smem.store(gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=mma_layout))
-        for d_start in range(0, D_V, BLOCK_D):
-            ds = d_start + d_offsets
-            ds_k = d_start + d_offsets_k
+        qk_copy_idx = 0
+        qk_read_idx = 0
+        ds = qk_copy_idx * BLOCK_D + d_offsets
+        ds_k = qk_copy_idx * BLOCK_D + d_offsets_k
+        q_mask = head_mask_q & (ds[None, :] < D_V)
+        q_ptrs = q_base + head_offsets[:, None] * stride_q_h + ds[None, :]
+        cp.async_copy_global_to_shared(q_smem.index(qk_copy_idx % 2), q_ptrs, mask=q_mask)
+        k_mask = valid[None, :] & (ds_k[:, None] < D_V)
+        k_ptrs = k_cache_ptr + kv_block_idx[None, :] * stride_k_block + kv_pos[None, :] * D_V + ds_k[:, None]
+        cp.async_copy_global_to_shared(k_smem.index(qk_copy_idx % 2), k_ptrs, mask=k_mask)
+        cp.commit_group()
+        qk_copy_idx += 1
+        for _ in range(1, D_V // BLOCK_D):
+            ds = qk_copy_idx * BLOCK_D + d_offsets
+            ds_k = qk_copy_idx * BLOCK_D + d_offsets_k
             q_mask = head_mask_q & (ds[None, :] < D_V)
             q_ptrs = q_base + head_offsets[:, None] * stride_q_h + ds[None, :]
-            cp.async_copy_global_to_shared(q_smem, q_ptrs, mask=q_mask)
+            cp.async_copy_global_to_shared(q_smem.index(qk_copy_idx % 2), q_ptrs, mask=q_mask)
             k_mask = valid[None, :] & (ds_k[:, None] < D_V)
             k_ptrs = k_cache_ptr + kv_block_idx[None, :] * stride_k_block + kv_pos[None, :] * D_V + ds_k[:, None]
-            cp.async_copy_global_to_shared(k_smem, k_ptrs, mask=k_mask)
+            cp.async_copy_global_to_shared(k_smem.index(qk_copy_idx % 2), k_ptrs, mask=k_mask)
             cp.commit_group()
-            cp.wait_group(0)
-            q_vals = q_smem.load(q_dot_layout)
-            k_vals = k_smem.load(k_dot_layout)
+            cp.wait_group(1)
+            q_vals = q_smem.index(qk_read_idx % 2).load(q_dot_layout)
+            k_vals = k_smem.index(qk_read_idx % 2).load(k_dot_layout)
             scores = scores_smem.load(mma_layout)
             partial = mma_v2(q_vals, k_vals, gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=mma_layout), input_precision="tf32")
             scores = scores + partial * sm_scale
             scores_smem.store(scores)
+            qk_copy_idx += 1
+            qk_read_idx += 1
+        cp.wait_group(0)
+        q_vals = q_smem.index(qk_read_idx % 2).load(q_dot_layout)
+        k_vals = k_smem.index(qk_read_idx % 2).load(k_dot_layout)
+        scores = scores_smem.load(mma_layout)
+        partial = mma_v2(q_vals, k_vals, gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=mma_layout), input_precision="tf32")
+        scores = scores + partial * sm_scale
+        scores_smem.store(scores)
         scores = scores_smem.load(mma_layout)
         scores = gl.where(valid_mma[None, :] & head_mask_mma, scores, -float("inf"))
         scores_smem.store(scores)

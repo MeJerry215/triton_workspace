@@ -1,0 +1,157 @@
+ {
+    "schemaVersion": 1,
+    "deviceProperties": [
+    {
+      "id": 0, "name": "NVIDIA A100 80GB PCIe", "totalGlobalMem": 85094825984,
+      "computeMajor": 8, "computeMinor": 0,
+      "maxThreadsPerBlock": 1024, "maxThreadsPerMultiprocessor": 2048,
+      "regsPerBlock": 65536, "warpSize": 32,
+      "sharedMemPerBlock": 49152, "numSms": 108
+    , "regsPerMultiprocessor": 65536, "sharedMemPerBlockOptin": 166912, "sharedMemPerMultiprocessor": 167936
+    },
+    {
+      "id": 1, "name": "NVIDIA A10", "totalGlobalMem": 23686938624,
+      "computeMajor": 8, "computeMinor": 6,
+      "maxThreadsPerBlock": 1024, "maxThreadsPerMultiprocessor": 1536,
+      "regsPerBlock": 65536, "warpSize": 32,
+      "sharedMemPerBlock": 49152, "numSms": 72
+    , "regsPerMultiprocessor": 65536, "sharedMemPerBlockOptin": 101376, "sharedMemPerMultiprocessor": 102400
+    }],
+    
+      "trace_id": "FA9D3F7C3FF64F509D28B3AB9C58F892",
+      "record_shapes": 1,
+      "cuda_driver_version": 13010,
+      "cuda_runtime_version": 13000,
+      "cupti_version": 130001,
+      "host_name": "84583de72ff2",
+    "displayTimeUnit": "ms",
+    "baseTimeNanoseconds": 1775078550000000000,
+    "traceEvents": [
+    
+  {
+    "ph": "M",
+    "name": "process_name",
+    "ts": 5910012146233.490,
+    "pid": 854457,
+    "tid": 0,
+    "args": {
+      "name": "python"
+    }
+  },
+  {
+    "ph": "M",
+    "name": "process_labels",
+    "ts": 5910012146233.490,
+    "pid": 854457,
+    "tid": 0,
+    "args": {
+      "labels": "CPU"
+    }
+  },
+  {
+    "ph": "M",
+    "name": "process_sort_index",
+    "ts": 5910012146233.490,
+    "pid": 854457,
+    "tid": 0,
+    "args": {
+      "sort_index": 854457
+    }
+  },
+  {
+    "ph": "M",
+    "name": "thread_name",
+    "ts": 5910012146233.490,
+    "pid": 854457,
+    "tid": 854457,
+    "args": {
+      "name": "thread 854457 (python)"
+    }
+  },
+  {
+    "ph": "M",
+    "name": "thread_sort_index",
+    "ts": 5910012146233.490,
+    "pid": 854457,
+    "tid": 854457,
+    "args": {
+      "sort_index": 854457
+    }
+  },
+  {
+    "ph": "M",
+    "name": "thread_name",
+    "ts": 5910012146233.490,
+    "pid": 854457,
+    "tid": 854457,
+    "args": {
+      "name": "thread 854457 (python)"
+    }
+  },
+  {
+    "ph": "M",
+    "name": "thread_sort_index",
+    "ts": 5910012146233.490,
+    "pid": 854457,
+    "tid": 854457,
+    "args": {
+      "sort_index": 854457
+    }
+  },
+  {
+    "ph": "X",
+    "cat": "cpu_op",
+    "name": "aten::empty",
+    "pid": 854457,
+    "tid": 854457,
+    "ts": 5910012146750.386,
+    "dur": 133.690
+    ,
+    "args": {
+      "External id": 1025,"Record function id": 0, "Concrete Inputs": ["[128, 1, 8, 512]", "15", "", "", "False", ""], "Input type": ["ScalarList", "Scalar", "", "", "Scalar", ""], "Input Strides": [[], [], [], [], [], []], "Input Dims": [[], [], [], [], [], []], "Ev Idx": 0
+    }
+  },
+  {
+    "ph": "X",
+    "cat": "Trace",
+    "name": "PyTorch Profiler (0)",
+    "pid": "Spans",
+    "tid": "PyTorch Profiler",
+    "ts": 5910012146000.596,
+    "dur": 3591395.572
+    ,
+    "args": {
+      "Op count": 0
+    }
+  },
+  {
+    "ph": "M",
+    "name": "process_sort_index",
+    "ts": 5910012146000.596,
+    "pid": "Spans",
+    "tid": 0,
+    "args": {
+      "sort_index": 536870912
+    }
+  },
+  {
+    "ph": "i",
+    
+    "s": "g",
+    "name": "Iteration Start: PyTorch Profiler",
+    "pid": "Traces",
+    "tid": "Trace PyTorch Profiler",
+    "ts": 5910012146000.596
+    
+  },
+  {
+    "ph": "i",
+    
+    "s": "g",
+    "name": "Record Window End",
+    "pid": "",
+    "tid": "",
+    "ts": 5910015738152.565
+    
+  }
+  ],"traceName": "profile_traces/bs128_topk2048/gqa_mla_gluon.json" }
