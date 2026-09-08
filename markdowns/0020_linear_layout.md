@@ -118,7 +118,189 @@ GPU 上的 thread id、warp id、register 索引 **本质上都是整数**，可
 
 > 如果映射在 GF(2) 上是线性的，则只需定义每个输入 bit 单独为 1 时的输出（**basis**），其余输入都是 basis 的 XOR。
 
-**线性性规则**：
+#### 2.1.1 GF(2) 域——bit 上的代数结构
+
+GF(2)（Galois Field，二元有限域）是仅含两个元素 $\{0,1\}$ 的域，其运算定义在模 2 算术下：
+
+| 加法 (+) | 0 | 1 |
+|---|---|---|
+| 0 | 0 | 1 |
+| 1 | 1 | 0 |
+
+| 乘法 (·) | 0 | 1 |
+|---|---|---|
+| 0 | 0 | 0 |
+| 1 | 0 | 1 |
+
+关键性质：
+- **加法等价于 XOR**：$1 + 1 = 0$（无进位），$a + b = a \oplus b$
+- **减法等价于加法**：因 $a + a = 0$，故 $a = -a$，域上无"借位"概念
+- **乘法等价于 AND**：$a \cdot b = a \ \text{AND} \ b$
+- **向量空间**：GF(2)$^n$ 构成 GF(2) 上的 $n$ 维向量空间，自然基是单位 bit 向量
+
+这一结构恰好对应 GPU 上整数坐标的位运算基础。
+
+#### 2.1.2 线性性定理与 basis 的存在性
+
+**定理**。设 $L: \{0,1\}^m \to \{0,1\}^n$ 是 GF(2) 线性映射，即满足：
+
+$$
+L(a \oplus b) = L(a) \oplus L(b), \quad \forall a,b \in \{0,1\}^m
+$$
+
+其中 $\oplus$ 是逐 bit XOR。则 $L$ 由其在**单位 bit 输入**上的取值唯一确定：
+
+$$
+L(x) = \bigoplus_{i=0}^{m-1} x_i \cdot L(2^i), \quad x = \sum_{i=0}^{m-1} x_i \cdot 2^i,\ x_i \in \{0,1\}
+$$
+
+**证明**。
+
+1. 对任意输入 $x \in \{0,1\}^m$，按二进制展开为 $x = \sum_i x_i \cdot 2^i$，等价于 $x = \bigoplus_{i: x_i=1} 2^i$。
+2. 对非零 bit 数 $k$ 做归纳：
+   - $k=1$：$L(x_i \cdot 2^i) = x_i \cdot L(2^i)$。$x_i=0$ 时由线性性 $L(0) = L(0 \oplus 0) = L(0) \oplus L(0) \Rightarrow L(0)=0$；$x_i=1$ 时 $L(2^i)=L(2^i)$，成立。
+   - 归纳步骤：设 $x$ 有 $k+1$ 个非零 bit，则 $x = a \oplus 2^j$，其中 $a$ 有 $k$ 个非零 bit、$x_j=1$：
+     $$
+     L(x) = L(a \oplus 2^j) = L(a) \oplus L(2^j)
+          = \bigoplus_{i \neq j} x_i \cdot L(2^i) \oplus L(2^j)
+          = \bigoplus_{i} x_i \cdot L(2^i).
+     $$
+3. 因此 $\boxed{L(x) = \bigoplus_i x_i \cdot L(2^i)}$，证毕。
+
+**推论**。每个 $L(2^i)$ 称为一个 **basis**（基向量）。只需存储 $m$ 个 basis 即可完整描述整个映射，存储成本 $O(m)$ 而非 $O(2^m)$。
+
+#### 2.1.3 GF(2) 线性是硬件设计的**必然选择**，而非软件附会
+
+GPU layout 映射天然落在这个框架内，核心原因不是"数学上方便"，而是**硬件电路本身就是这么造的**。
+
+##### 为什么硬件选择了 XOR？
+
+NVIDIA 从 Maxwell 架构开始就在 shared memory 中引入 XOR swizzle 来避免 bank conflict。其硬件地址生成逻辑可以简化为：
+
+```
+物理地址 = 逻辑地址 ⊕ (row_pattern << shift)
+```
+
+为什么是 XOR 而不是加法 `+`？
+
+| 操作 | 电路门数（近似） | 延迟 | 能否在地址生成的同一时钟周期完成 |
+|---|---|---|---|
+| XOR（按位异或） | 每个 bit 4 个晶体管 | ~1 FO4 | ✅ 可以 |
+| 加法（带进位） | 每个 bit 28 个晶体管（CLA） | ~4 FO4 | ❌ 需要额外流水级 |
+
+> FO4：Fan-Out of 4，标准延迟单元。4 FO4 意味着加法延迟是 XOR 的约 4 倍。
+
+**XOR 是组合逻辑**：输出仅依赖当前输入，没有进位链。**加法是时序逻辑**：低 bit 的进位要传递到高 bit，进位链随位宽线性增长。在 32 bit 地址上，加法的关键路径是 XOR 的 10 倍以上。
+
+硬件工程师选择 XOR 不是因为"它恰好是 GF(2) 上的加法"，而是因为 **XOR 门在芯片上面积最小、延迟最低、功耗最少**——而 GF(2) 的加法定义恰好就是 XOR。换句话说，**GF(2) 的加法公理就是从 XOR 门的物理行为中抽象出来的**。
+
+##### 硬件坐标天生是 GF(2) 向量
+
+GPU 上的所有坐标——lane id、warp id、register index、shared memory offset——本质上都是二进制整数的 bit 向量：
+
+```
+lane_id      = b₄ b₃ b₂ b₁ b₀     (0–31,  5 bit)
+warp_id      = b₉ b₈ b₇ b₆ b₅     (0–... , 高位 bit)
+shared_addr  = a₃₁ a₃₀ ... a₁ a₀  (32 bit 地址)
+```
+
+两个坐标的**拼接、拆分、掩码**在电路层面直接对应 bit 选通（wire cut / wire merge），而 XOR 就是 1 个逻辑门。这些操作在 GF(2) 上都是线性运算，不需要进位、不需要查表。
+
+##### 硬件 swizzle 的三种基本操作都是 GF(2) 线性
+
+NVIDIA shared memory 的 swizzle 模式可以分解为三种原子操作：
+
+1. **XOR swizzle**：$\text{addr}' = \text{addr} \oplus (\text{row} \ll k)$
+   - 硬件实现：对地址的某几位 XOR 上 row 的某几位
+   - GF(2) 线性性：$L(a \oplus b) = L(a) \oplus L(b)$ 直接成立
+
+2. **Mask（位掩码）**：$\text{addr}' = \text{addr} \ \&\  \text{mask}$
+   - 硬件实现：AND 门阵
+   - GF(2) 线性性：AND 本身不是线性的（$x \ \&\  y \neq L(x) \oplus L(y)$），但当 mask 是常数时，$L(x) = x \ \&\  \text{mask}$ 是线性映射（可看作投影到子空间）
+
+3. **Shift（移位）**：$\text{addr}' = x \ll k$ 或 $x \gg k$
+   - 硬件实现：wire 重排（barrel shifter）
+   - GF(2) 线性性：移位相当于重新排列输入的 bit，显然线性
+
+这几种操作在硬件上组合出的所有 swizzle pattern，恰好构成 GF(2) 线性映射的**全集**——不多不少。
+
+##### "硬件决定编译器，编译器反映硬件"的闭环
+
+```
+NVIDIA 硬件设计
+    │
+    ├── shared memory 只提供 XOR/shift/mask swizzle
+    ├── lane/warp id 是 bit 拼接（而非任意排列）
+    └── 地址生成器中不含整数加法器用于 swizzle
+          │
+          ▼
+Triton 编译器设计
+    │
+    ├── LinearLayout 用 basis (XOR 组合) 编码所有 layout
+    ├── convert_layout 只做 GF(2) 线性变换（矩阵运算）
+    └── 无法表示 L(x)=x+1 → 但硬件也不需要
+          │
+          ▼
+结论：GF(2) 线性不是 compiler 强加的限制，
+     而是对硬件能力的**精确建模**。
+```
+
+这就是为什么说 **GF(2) 线性是硬件设计的必然选择**：硬件用了 XOR → compiler 必须用 GF(2) 线性来建模；反过来，compiler 选择 GF(2) 线性是因为硬件只提供了 XOR 操作——两者互为因果。
+
+#### 2.1.4 为什么需要 LinearLayout——传统方案对比
+
+| 比较维度 | 传统 Look-Up Table | LinearLayout（basis 表示） |
+|---|---|---|
+| 存储成本 | $O(\text{tile\_size})$，大 tile 爆炸 | $O(\log \text{tile\_size})$ |
+| layout 组合 $(L_1 \circ L_2)$ | 重新查表或手动拼接 | 矩阵乘法：basis 在 $L_2$ 下 apply 再组合 |
+| invert（求逆） | $\Theta(n \log n)$ 排序 | 解 GF(2) 线性方程组 |
+| slice / reshape | 重建整表 | 只切 basis，$O(1)$ |
+| 参数化（改 sizePerThread） | 必须重建 encoding → 重建表 | 从 encoding 重新 parse 出 basis |
+
+**核心思想**：LinearLayout 把 layout 映射转化为 **GF(2) 线性代数问题**，从而用线性代数工具（矩阵求逆、基变换、线性组合）解决编译器中的 layout 推导。
+
+#### 2.1.5 能否覆盖 Triton 中的所有 Layout Swizzle？
+
+| Layout / Encoding | 是否可用 LinearLayout 表示 | 说明 |
+|---|---|---|
+| `blocked`（coalesced / blocked 模式） | ✅ | 见 §4 手推例子 |
+| `swizzled_shared`（XOR swizzle） | ✅ | $\text{col} \oplus \text{row}$ 等模式都是 GF(2) 线性组合 |
+| `nvidia_mma`（MMA 布局） | ✅ | warp 内 lane 分配、warp 间 tiled 均可由 basis 描述 |
+| `shared_encoding`（offset 版） | ✅ | offset bit 分配 + mask，basis 直接表达 |
+| `tmem_encoding`（TMEM） | ✅ | register + lane 映射同样适用 |
+
+**Limitation——不能表示的 layout**：
+
+| 反例 | 原因 |
+|---|---|
+| $L(x) = x + 1$（整数加法） | 加法需进位，$1 \oplus 1 = 0$ 但 $1 + 1 = 2 \neq 0 + 0$ |
+| 任意置换表 | 存储 $O(n)$，且一般置换非 GF(2) 线性 |
+| 条件分支依赖的布局 | 分段映射破坏全局线性 |
+
+但这些在 Triton 实际硬件 swizzle 中**均不会出现**。NVIDIA 硬件只支持 XOR / mask / shift 形式。因此 **LinearLayout 对 Triton 编译器是充分且必要的**：
+- **必要**：basis 表示是存储效率最高的精确表示
+- **充分**：所有真实 encoding（blocked、MMA、shared、TMEM）都在 GF(2) 线性范围内
+
+**同一维度内全是 GF(2) 运算**：
+
+注意 `register`、`lane`、`warp`、`block` 等输入维度各自内部的 basis 组合**全部是 GF(2) 线性运算**——即用 XOR（`⊕`）和标量乘法（`·`），**永远不会出现整数加法进位**。同一维度内，多个基向量的线性组合：
+
+```
+L(bit0 · 2⁰ ⊕ bit1 · 2¹ ⊕ ...) = L(2⁰) ⊕ L(2¹) ⊕ ...   if bitX = 1
+                                = 0                        if bitX = 0
+```
+
+每个 bit 独立映射后 XOR 合并，无进位传播。这是 LinearLayout 能做到 **O(log n) 存储**和 **O(1) 求逆**的根本原因——若用整数加法替代 XOR，线性性会立即被进位破坏。以 `warpsPerCTA=[4, 1]` 为例：
+
+```
+warp_id = b1·2 + b0        (b1,b0 ∈ {0,1})
+L(warp_id) = L(b0·2⁰) ⊕ L(b1·2¹)
+           = (b0·basis[0]) ⊕ (b1·basis[1])
+```
+
+并非 `L(warp_id) = L(b0·2⁰) + L(b1·2¹)`（整数加法），而是 **XOR 组合**。
+
+**线性性规则**（等价于定理中的条件）：
 
 ```
 L(a ⊕ b, ...) = L(a, ...) ⊕ L(b, ...)
@@ -410,6 +592,277 @@ A X = B
 | `invert()` | 严格求 `M^-1` | layout 必须可逆：满射 + bit 数相等 |
 | `pseudoinvert()` | 求一个右逆/伪逆 | 要能覆盖目标；自由变量取 0 |
 | `invertAndCompose(outer)` | 先反解 `outer`，再和当前 layout 组合 | 常用于 register ↔ shared layout conversion |
+
+### 2.5 LinearLayout 的表达能力边界：能表示什么，不能表示什么
+
+这是一个核心问题：**LinearLayout 是否能够表示任意的 swizzle 排布？如果用户有特殊的 layout 需求，能否随意表示一个 tensor 的排布？**
+
+答案分两层：**GF(2) 线性范围内的，全部可以；超出 GF(2) 线性的，一个都不能**。
+
+#### 2.5.1 什么排布可以用 LinearLayout 精确表示
+
+任何满足以下条件的映射都可以：
+
+```
+L(输入坐标) = 输出坐标    （每个坐标分量都是输入 bit 的 XOR 组合）
+```
+
+等价于用 **GF(2) 上的矩阵乘法** 描述：
+
+```
+output_bits = M × input_bits   (mod 2)
+```
+
+这意味着以下所有 GPU 排布都在表达能力之内：
+
+| 排布类型 | 是否可表示 | 举例 |
+|----------|-----------|------|
+| **连续/coalesced blocked** | ✅ | `blocked({4},{32},{1})` 标准行连续 |
+| **order 交换** | ✅ | `order=[1,0]` vs `[0,1]` 只是交换矩阵列排列 |
+| **wrap（shape > tile）** | ✅ | 高位 register bit 做 tile 复制（§6.4） |
+| **broadcast（shape < tile）** | ✅ | 某些输出 bit 不依赖某些输入 bit，矩阵列全零（§6.3.1） |
+| **所有 GPU swizzle** | ✅ | `col ⊕ phase(row)` 对 power-of-two 参数是 bit 截取 + XOR |
+| **MMA 输出 layout** | ✅ | kWidth、lane 分配、half-tile 拼接全由 `operator*` 中的 identity 子 layout 合成 |
+| **Dot operand broadcast** | ✅ | K 维对应的输出 bit 不从任何输入 bit 获得，相当于矩阵该列全零 |
+| **shared swizzle** | ✅ | `vec/perPhase/maxPhase` 在 power-of-two 约束下等价于 row bit 的 col 分量 XOR |
+| **任意线性置换** | ✅ | 直接写 bases（`LinearEncodingAttr` / `DistributedLinearLayout`）可以实现任何可逆 GF(2) 线性映射 |
+
+**关键原因**：标准 GPU swizzle 公式
+
+```
+outCol = inCol ⊕ phase(row)
+phase(row) = ((row / perPhase) % maxPhase) * vec
+```
+
+当 `perPhase`、`maxPhase`、`vec` 都是 2 的幂时，`phase(row)` 等价于从 row 的二进制表示中**截取一段 bit**，因此 `phase(row₁ ⊕ row₂) = phase(row₁) ⊕ phase(row₂)`。这保证了 swizzle 是 GF(2) 线性的。
+
+**所以：任何用 XOR/AND/移位（无进位）组合出来的排布，LinearLayout 都能精确表示。**
+
+#### 2.5.2 什么排布不能用 LinearLayout 表示（含完整场景对比）
+
+下面每一条都先用 **tensor 排布场景** 描述你想要什么，再解释为什么 LinearLayout 做不到。
+
+---
+
+##### 反例 1：有进位加法——Tensor 内 thread 到元素的映射不是 bit 拼接
+
+**想要的排布**：2D tensor `[4, 4]`，4 个 warp（w=0..3），4 个 lane（ℓ=0..3），希望：
+
+```
+L(ℓ, w) = (row, col) = (ℓ + w, ℓ)     // row = ℓ + w（普通整数加法，不是 XOR）
+```
+
+直观地说，row 坐标等于 lane id 加 warp id。来看这个映射的结果：
+
+```
+        w=0     w=1     w=2     w=3
+  ℓ=0  (0,0)   (1,0)   (2,0)   (3,0)
+  ℓ=1  (1,1)   (2,1)   (3,1)   (4,1)
+  ℓ=2  (2,2)   (3,2)   (4,2)   (5,2)
+  ℓ=3  (3,3)   (4,3)   (5,3)   (6,3)
+```
+
+**为什么不行？** 检查线性性：`L(ℓ=1, w=0) = (1,1)`，`L(ℓ=0, w=1) = (1,0)`。如果可线性叠加，应该 `L(ℓ=1, w=1) = L(1,0) ⊕ L(0,1) = (1,1) ⊕ (1,0) = (0,1)`。但实际 `L(1,1) = (2,1)`。
+
+原因是 ℓ=1 和 w=1 叠加时，row 维出现 `1+1=2`，**进位** bit 改变了高位。而 XOR 加法 `1⊕1=0`，不会产生进位，所以得不到 `(2,1)`。
+
+> **本质区别**：
+> - 可表示：`row = ℓ ⊕ w`（XOR，无进位）→ 这是标准的 swizzle
+> - 不可表示：`row = ℓ + w`（整数加法，有进位）
+
+**对比**：可表示的 swizzle `row = ℓ, col = w ⊕ ℓ` 结果（来自 §2.3）：
+
+```
+        w=0     w=1     w=2     w=3
+  ℓ=0  (0,0)   (0,1)   (0,2)   (0,3)
+  ℓ=1  (1,1)   (1,0)   (1,3)   (1,2)
+  ℓ=2  (2,2)   (2,3)   (2,0)   (2,1)
+  ℓ=3  (3,3)   (3,2)   (3,1)   (3,0)
+```
+
+这个表里每个元素都由 XOR 得到，可验证可叠加。
+
+---
+
+##### 反例 2：任意置换表——线程到元素的映射没有代数结构
+
+**想要的排布**：8 个 lane（ℓ=0..7），一维 tensor `[8]`，希望 thread 任意分配：
+
+```
+ℓ:   0  1  2  3  4  5  6  7
+T[?]: 3  7  0  4  2  6  1  5
+```
+
+也就是 `L(0)=3, L(1)=7, L(2)=0, L(3)=4, L(4)=2, L(5)=6, L(6)=1, L(7)=5`。
+
+**为什么不行？** 这个映射是人类随便写出来的，没有任何代数结构。写成 basis 的话，需要每个 bit 单独翻转时的输出增量。但这里：
+
+```
+L(1)     = 7   (0b001 → 0b111)
+L(2)     = 0   (0b010 → 0b000)
+L(1⊕2)=L(3) = 4   (0b011 → 0b100)
+```
+
+如果它是线性的，应该 `L(3) = L(1) ⊕ L(2) = 7 ⊕ 0 = 7`，但实际是 4。不相等。
+
+> 所以 **"我想让每个 thread 精确地持有我指定的元素"** 这种需求，如果指定方式没有线性结构，LinearLayout 无法表达。
+
+**实践意义**：实际 GPU kernel 很少需要这种完全任意的分配——你通常只关心数据在 memory 里是否连续、跨步是否对齐、bank conflict 是否少。这些需求大多落在 GF(2) 线性范围内。
+
+---
+
+##### 反例 3：条件分支——排布策略随硬件坐标的值变化
+
+**想要的排布**：8 个 lane 分两组——前 4 个 lane 沿 dim0 铺，后 4 个 lane 沿 dim1 铺：
+
+```
+L(ℓ) = 如果 ℓ < 4, 则 (ℓ, 0)     // 前 4 个线程持有行坐标不同的元素
+        否则,     则 (0, ℓ-4)     // 后 4 个线程持有列坐标不同的元素
+```
+
+排布表：
+
+```
+ℓ=0 → (0,0)    ℓ=1 → (1,0)    ℓ=2 → (2,0)    ℓ=3 → (3,0)
+ℓ=4 → (0,0)    ℓ=5 → (0,1)    ℓ=6 → (0,2)    ℓ=7 → (0,3)
+```
+
+**为什么不行？** 这个映射需要依赖 `ℓ < 4` 这个**大小比较**。它把 ℓ 作为一个整体来判定（< 4 还是 ≥ 4），而不是对 ℓ 的每个 bit 独立定义映射。`ℓ < 4` 等价于 "ℓ 的高位 bit 都是 0"——但这涉及到**跨 bit 的依赖**（多个输入 bit 合起来决定输出），不是每个 bit 独立贡献然后 XOR。
+
+> **能否用多个 basis 的 XOR 实现条件分支？**
+>
+> 不能。XOR 没有"if-then-else"语义。每个输出坐标是 **所有输入 bit 的 XOR 之和**，不存在某些 bit 组合触发一个完全不同的映射路径。
+
+---
+
+##### 反例 4：非 2 的幂除法/取模——phase 函数不可分解为 bit 运算
+
+**对比**：Triton 标准 swizzle 之所以可表示，是因为 `perPhase` 和 `maxPhase` 都是 2 的幂：
+
+```
+perPhase = 2, maxPhase = 4  →  phase(row) = ((row / 2) % 4) × vec
+```
+
+这里 `row / 2` 是右移 1 bit，`% 4` 是截取低 2 bit——**都是 bit 域操作**，所以能在 GF(2) 上线性表达。
+
+**想要的排布**：用户想用 `perPhase = 3, maxPhase = 5`：
+
+```
+outCol = inCol ⊕ ((row / 3) % 5) × vec
+```
+
+`row / 3` 不是简单的右移——它涉及非 2 的幂除法，结果随 row 的变化不是线性 bit 翻转。例如 `row=3` 时 `row/3=1`，`row=4` 时 `row/3=1`（不变），`row=5` 时 `row/3=1`，`row=6` 时 `row/3=2`。这个步长 3 的周期性无法用 XOR 模拟。
+
+> 换个说法：除法的结果是 row 的**非线性函数**，不是各 bit 贡献的 XOR 和。
+
+---
+
+##### 反例 5：thread 维度的 stride 不是 2 的幂
+
+**想要的排布**：每个 lane 在 dim0 上持有 3 个连续元素，然后下一个 lane 从 +3 开始：
+
+```
+ℓ=0: T[0,0], T[0,1], T[0,2]
+ℓ=1: T[1,0], T[1,1], T[1,2]
+ℓ=2: T[2,0], T[2,1], T[2,2]
+...
+```
+
+也就是 `L(register, lane) = (lane × 3 + register × 1)`。
+
+**为什么不行？** 首先 `register` 维 basis 是正常的：`L(reg=1) = (1)`。但 `lane` 维需要 `L(ℓ=1) = (3)`。我们来验证线性性：
+
+```
+L(ℓ=1) = (3)   → 0b001 → 0b011
+L(ℓ=2) = (6)   → 0b010 → 0b110
+L(ℓ=3) = (9)   → 0b011 → 0b1001
+```
+
+`L(1⊕2) = L(3) = 9`，但 `L(1) ⊕ L(2) = 3 ⊕ 6 = 5`。不相等。
+
+原因就是 `×3` 产生了进位：3 的二进制是 `0b11`，乘法中 bit 1 的贡献会进位影响 bit 2。
+
+> **对比**：如果 stride 是 2 的幂（如 stride=4），则 `L(ℓ=1) = (4)`，此时 `L(ℓ=2) = (8)`，`L(ℓ=3) = 4⊕8 = 12`。因为 `×4` 等价于左移 2 位，没有进位问题。
+
+---
+
+##### 快速判断清单
+
+| 你想要的排布特征 | 能否用 LinearLayout | 直觉判断 |
+|-----------------|-------------------|----------|
+| 沿某维 stride = 2 的幂 | ✅ | 等价于移位，无进位 |
+| 沿某维 stride 是任意整数（如 3, 5, 6） | ❌ | 整数乘法有进位 |
+| swizzle 参数是 2 的幂 | ✅ | 右移+截取 bit |
+| swizzle 参数是任意整数 | ❌ | 除法/取模不是 bit 运算 |
+| 线程到元素的分配是任意排列 | ❌ | 没有代数结构 |
+| 排布在某个阈值前后策略不同 | ❌ | 需要条件分支 |
+| 排布由 XOR/AND/移位组合得到 | ✅ | 每 bit 独立贡献，无进位 |
+
+#### 2.5.3 那我到底能不能"自定义"一个排布？
+
+**可以——只要你的自定义排布是 GF(2) 线性的。**
+
+Triton 提供了两种自定义路径：
+
+##### 路径 A：用 BlockedEncoding 参数化（受限但方便）
+
+```python
+layout = gl.BlockedLayout(
+    size_per_thread=[1, 4],
+    threads_per_warp=[4, 1],
+    warps_per_cta=[4, 1],
+    order=[1, 0],
+)
+```
+
+这实际上只能表达 **identity-like 的分布**（每个硬件维沿某些输出维连续递增），但它已经覆盖了绝大多数 kernel 场景。
+
+##### 路径 B：直接用 bases（完全控制 GF(2) 线性映射）
+
+```python
+# Gluon 前端
+layout = gl.DistributedLinearLayout(
+    reg_bases=[[0, 1], [0, 2]],    # register bit → 输出坐标增量
+    lane_bases=[[1, 0], [2, 0]],
+    warp_bases=[[4, 0], [8, 0]],
+    block_bases=[],
+    shape=[16, 16],
+)
+# ↔ IR: #ttg.linear<{register = ..., lane = ..., ...}>
+```
+
+这允许**任意 GF(2) 线性映射**：只要你想好每个输入 bit 单独翻转时输出坐标变多少，就可以写出 bases 表。
+
+> **如何判断一个自定义排布是否可写？**
+>
+> 对每个硬件输入维（register / lane / warp / block）的每个 bit $2^i$，问自己：**如果只有这个 bit 从 0 变成 1，逻辑张量的哪个坐标分量会改变？变多少？**
+>
+> 如果整个映射可以由这些"单 bit 变化"的结果通过 XOR 叠加出来，那就可以；否则不行。
+
+##### 什么时候需要路径 B？
+
+- 用户知道自己的 MMA tile 特殊排布，需要精确控制每个 thread 持有的 register
+- 用户想实现自定义的 shared swizzle 模式（如绕过标准 `vec/perPhase/maxPhase` 的约束，直接指定每个 offset bit 映射到哪个逻辑坐标）
+- 用户在做 experimental kernel 或 proto，想先手写一个 layout 验证思路
+- **苏红**（或你团队里的同事）如果对 layout 有特殊需求——比如想把 dim0 的连续 stride 拆到多个输入维上、或者要实现某种非标准的 parity-based 排布——**只要排布在数学上可以用 XOR 组合描述，就可以通过路径 B 实现**
+
+##### 什么情况下 LinearLayout 确实不够用？
+
+如果你想要的排布是上面 §2.5.2 里那类非 GF(2) 线性的映射（例如任意置换表、有进位的整数运算、条件分支），LinearLayout 就无法精确表达。这种情况下需要：
+
+1. **绕道实现**：在 Triton kernel 层面用 `tl.arange` + 手工 mask + `tl.store`/`tl.load` + 额外 buffer 实现重排
+2. **扩展编译器**：在 MLIR 里加新的 encoding 类型（如 lookup-table-based encoding），这属于编译器开发范畴
+
+#### 2.5.4 总结
+
+| 你的需求 | 能不能用 LinearLayout | 怎么做 |
+|----------|----------------------|--------|
+| 标准 blocked 排布（连续/按 order 铺） | ✅ | `gl.BlockedLayout` |
+| standard swizzle（vec/perPhase/maxPhase） | ✅ | `gl.SwizzledSharedLayout` 或 `gl.SharedLinearLayout` |
+| 自定义 XOR/bit 重排（可逆线性映射） | ✅ | `gl.DistributedLinearLayout` 手写 bases |
+| 任意置换表（非线性） | ❌ | kernel 内手动重排 |
+| 有进位的地址重映射 | ❌ | kernel 内手动计算 |
+| 条件分支/大小比较决定排布 | ❌ | 运行时逻辑 + 通用访存 |
 
 ---
 
@@ -1744,7 +2197,7 @@ row 循环：row=1 → swizzle = (2 * ((1/1)%2)) % 8 = 2 → basis {1,2}  (input
 不同 TritonGPU layout 使用不同的输入维（维度名是约定，不是硬编码；底层数学是同一套 GF(2) 线性映射）：
 
 | Layout 类型 | 输入维 | 含义 | 来源 |
-|---|---|---|---|---|
+|---|---|---|---|
 | `blocked`（register） | `[register, lane, warp, block]` | 线程序列号 → warp 内 thread × warp × CTA | `TritonGPUAttrDefs.td` encoding |
 | `nvidia_mma`（register） | `[register, lane, warp, block]` | register/lane bit 分配由 MMA 指令几何决定 | `TritonGPUAttrDefs.td` encoding |
 | `shared`（swizzled / linear / amd） | `[offset, block]` | shared memory 元素偏移 × CTA | `TritonGPUAttrDefs.td` encoding |
@@ -2375,6 +2828,50 @@ layout = gl.BlockedLayout(
 ```
 
 需要非标准排布时，再用 `DistributedLinearLayout` 直接写 bases。
+
+#### Gluon 里能不能对 BlockedLayout 调 `toLinearLayout`？
+
+**能。** C++ 的 `ttg::toLinearLayout(shape, encoding)` 在 Gluon 前端对应的是 **builtin** `gl.to_linear_layout(layout, shape)`，不是 `BlockedLayout` 上的方法。`BlockedLayout` / `SliceLayout` / MMA / shared 等都可以传进去（`AutoLayout` 和已经是 `DistributedLinearLayout` 的对象会原样返回，不再转换）。
+
+调用必须在 `@gluon.jit` 里（编译期 `constexpr`），并且 **必须带 shape**：同一套 blocked 参数配不同 shape，会因 `ensureLayoutNotSmallerThan` 补出不同的 register wrap bit。
+
+```python
+@gluon.jit
+def kernel(...):
+    blocked: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[4, 1],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+    # 返回 DistributedLinearLayout；IR 侧是 #ttg.linear<{...}>
+    linear: gl.constexpr = gl.to_linear_layout(blocked, [16, 16])
+```
+
+对上面这个例子，转换结果等价于：
+
+```python
+gl.DistributedLinearLayout(
+    reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8]],  # 原始 [1,4] 只有前两项；后两项是 shape=[16,16] 补的
+    lane_bases=[[1, 0], [2, 0]],
+    warp_bases=[[4, 0], [8, 0]],
+    block_bases=[],
+    shape=[16, 16],
+)
+```
+
+和手写 `reg_bases=[[0,1],[0,2]]` **不是同一份 bases**：手写那份只覆盖 `16×4`，编译器从 blocked + shape 转出来会再补 `[0,4]`、`[0,8]`。这也是「不要一上来就手写 LinearLayout」的原因之一——shape 调整是 `toLinearLayout` 的一部分。
+
+**不建议**在 kernel 入口把所有 layout 都先转成 `DistributedLinearLayout` 再用：
+
+| | 继续用 `BlockedLayout` | 转成 / 手写 `DistributedLinearLayout` |
+|--|--|--|
+| IR encoding | `#ttg.blocked<{...}>` | `#ttg.linear<{...}>` |
+| 写起来 | 四元组，好改 | bases 表，改一个 bit 就要重算 |
+| 下游 API | 部分 op 显式要求 blocked（如 `gl.dot_fma` 的 acc） | 任意 GF(2) 映射；有的 API 不接受 |
+| 编译器内部 | LLVM 前仍会 `toLinearLayout` | 已经是 canonical 形式 |
+
+推荐分工：日常 kernel 用 `BlockedLayout`；需要 **看 bases / `static_assert` 对照 / 自定义 XOR 排布** 时再 `to_linear_layout` 或手写 `DistributedLinearLayout`。编译器在 `TritonGPUToLLVM` 里对 `#ttg.blocked` 自己会转，不必在 Gluon 里提前转完。
 
 ### 8.4 动手验证：对照 `SimpleBlocked` 测试
 

@@ -2,8 +2,7 @@
 TileLang LayerNorm 前向 Op
 
 基于 tilelang/examples/norm/layernorm.py 简化而来。
-包含前向 kernel 和 torch autograd Function 封装，
-支持 float16 / bfloat16 输入。
+仅包含前向 kernel，支持 float16 / bfloat16 输入。
 
 用法:
     python ops/tilelang/layernorm.py          # 运行正确性验证 + 性能对比
@@ -14,12 +13,19 @@ import argparse
 import torch
 import tilelang
 import tilelang.language as T
+from tilelang.transform import PassConfigKey
 
 # ---------------------------------------------------------------------------
 # TileLang Kernel: LayerNorm Forward
 # ---------------------------------------------------------------------------
 
-@tilelang.jit(out_idx=[-3, -2, -1])
+@tilelang.jit(
+    out_idx=[-3, -2, -1],
+    pass_configs={
+        PassConfigKey.TL_ENABLE_DUMP_IR: True,
+        PassConfigKey.TL_DUMP_IR_DIR: "./dump",
+    }
+)
 def _layernorm_fwd(
     N: int,
     D: int,
@@ -105,7 +111,7 @@ def _layernorm_fwd(
 
 
 # ---------------------------------------------------------------------------
-# Torch dtype 映射
+# dtype 映射 & 前向调用
 # ---------------------------------------------------------------------------
 
 _TORCH_DTYPE_TO_TL = {
@@ -114,49 +120,22 @@ _TORCH_DTYPE_TO_TL = {
 }
 
 
-# ---------------------------------------------------------------------------
-# LayerNorm torch.autograd Function
-# ---------------------------------------------------------------------------
-
-class LayerNormFn(torch.autograd.Function):
-    """LayerNorm 前向（torch autograd 封装）。"""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float = 1e-5):
-        if x.dtype not in _TORCH_DTYPE_TO_TL:
-            raise TypeError(
-                f"layer_norm: unsupported dtype {x.dtype}; "
-                f"supported: {list(_TORCH_DTYPE_TO_TL)}"
-            )
-        if gamma.dtype != x.dtype or beta.dtype != x.dtype:
-            raise TypeError(
-                f"layer_norm: x, gamma, beta must share dtype, "
-                f"got {x.dtype}, {gamma.dtype}, {beta.dtype}"
-            )
-        N, D = x.shape
-        in_dtype = _TORCH_DTYPE_TO_TL[x.dtype]
-        kernel = _layernorm_fwd(N, D, eps=eps, in_dtype=in_dtype, out_dtype=in_dtype)
-        y, mean, rstd = kernel(x, gamma, beta)
-        ctx.save_for_backward(x, gamma, mean, rstd)
-        ctx.eps = eps
-        return y
-
-    @staticmethod
-    def backward(ctx, dy):
-        x, gamma, mean, rstd = ctx.saved_tensors
-        # 简化：反向用 PyTorch 原生实现（如需 tilelang 反向 kernel，见
-        # tilelang/examples/norm/layernorm.py 中的 _layernorm_bwd）
-        dx = torch.empty_like(x)
-        with torch.no_grad():
-            # 此处使用 PyTorch 作为 backward 占位
-            dx = torch.nn.functional.layer_norm(x, (x.shape[-1],), gamma, mean - mean + rstd - rstd)
-            # 实际应调用 tilelang bwd kernel
-        return dx, None, None, None
-
-
 def layer_norm(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float = 1e-5):
-    """LayerNorm 前向函数。"""
-    return LayerNormFn.apply(x, gamma, beta, eps)
+    if x.dtype not in _TORCH_DTYPE_TO_TL:
+        raise TypeError(
+            f"layer_norm: unsupported dtype {x.dtype}; "
+            f"supported: {list(_TORCH_DTYPE_TO_TL)}"
+        )
+    if gamma.dtype != x.dtype or beta.dtype != x.dtype:
+        raise TypeError(
+            f"layer_norm: x, gamma, beta must share dtype, "
+            f"got {x.dtype}, {gamma.dtype}, {beta.dtype}"
+        )
+    N, D = x.shape
+    in_dtype = _TORCH_DTYPE_TO_TL[x.dtype]
+    kernel = _layernorm_fwd(N, D, eps=eps, in_dtype=in_dtype, out_dtype=in_dtype)
+    y, _, _ = kernel(x, gamma, beta)
+    return y
 
 
 # ---------------------------------------------------------------------------

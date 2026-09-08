@@ -8,7 +8,7 @@
 #       不需要额外设置 PYTHONPATH。
 #
 
-source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate triton
+source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate tilelang
 
 # 脚本所在目录（兼容 source 和直接执行两种方式）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
@@ -23,7 +23,7 @@ export TILELANG_PRINT_ON_COMPILATION=1        # kernel 编译时打印名称
 export TILELANG_CACHE_DIR="$SCRIPT_DIR/.cache/tilelang"
 export TILELANG_TMP_DIR="$TILELANG_CACHE_DIR/tmp"
 export TILELANG_KERNEL_CACHE_USE_LIB_STAMP=0  # 缓存键是否包含 lib 哈希
-export TILELANG_DISABLE_CACHE=0               # 禁用缓存（调试用）
+export TILELANG_DISABLE_CACHE=1               # 禁用缓存（调试用）
 export TILELANG_CLEANUP_TEMP_FILES=1          # 编译后清理临时文件
 export TILELANG_JIT_DIAGNOSTICS=0             # JIT 阶段诊断
 
@@ -37,9 +37,13 @@ export TILELANG_DEFAULT_TARGET="auto"
 export TILELANG_COMPILE_TIMEOUT_SECONDS=""
 
 # ===== TileLang Pass 调试 =====
-# 0=off, terminal=终端彩色diff, html=HTML报告, both=两者
+# TILELANG_PASS_DIFF — 零侵入，无需改代码即可看到每个 pass 前后的 IR diff
+#   0=off, terminal=终端彩色diff, html=HTML报告, both=两者
 export TILELANG_PASS_DIFF=0
 export TILELANG_PASS_DIFF_OUTPUT="$SCRIPT_DIR/.pass_diff"
+#
+# 注意：TL_ENABLE_DUMP_IR 不是环境变量，必须改 @jit 加 pass_configs 才能启用。
+# 如果不想改代码，用 TILELANG_PASS_DIFF 代替。
 
 # ===== 第三方库路径（按需设置）=====
 # TileLang 通常会自动检测 3rdparty 路径；若自动检测失败可手工指定

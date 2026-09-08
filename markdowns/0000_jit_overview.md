@@ -221,3 +221,168 @@
 - 然后仍然走 `llir -> ptx -> cubin`
 
 也就是前端入口不同，但后半段后端生成链路一致。
+
+---
+
+## 7) Triton 3.6 常量参数特化与 constant-1 fold
+
+### 7.1 结论速览
+
+| 问题 | Triton 3.6 现状 |
+|------|----------------|
+| `jit.py` 里有没有 `compute_spec_key` / `AttrsDescriptor.is_equal_to_1`？ | **没有**，已在 #5512 重构中移除 |
+| constant-1 fold 还存在吗？ | **存在**，但逻辑下沉到 C++ `native_specialize_impl` |
+| `tt.equal_to` MLIR 属性还存在吗？ | **不存在**，改为统一的 `constexpr` 路径 |
+| Python 调用签名一致吗？ | **一致**——用户始终传相同参数列表 |
+| MLIR / CUDA kernel 签名一致吗？ | **不一致**——`constexpr` 参数从 IR 函数签名中移除 |
+
+### 7.2 旧机制（3.6 之前）vs 新机制（3.6）
+
+#### 旧机制（两套并行逻辑）
+
+```python
+# jit.py
+def compute_spec_key(v, align):
+    if align and hasattr(v, "data_ptr") and (v.data_ptr() % 16 == 0):
+        return "D"
+    elif isinstance(v, int):
+        if align and (v % 16 == 0):
+            return "D"
+        elif v == 1:
+            return "1"   # ← cache key 中的 "1" 标记
+    return "N"
+
+# backends/compiler.py — AttrsDescriptor
+@staticmethod
+def is_equal_to_1(x):
+    return isinstance(x, int) and not isinstance(x, bool) and x == 1
+```
+
+旧流程对 `int == 1` 做两件事：
+
+1. `compute_spec_key` 返回 `"1"` → 影响 kernel cache key
+2. `AttrsDescriptor` 设置 `tt.equal_to` 属性 → 后端 pass 可用此 hint 做优化
+
+#### 新机制（统一 constexpr 路径）
+
+逻辑从 Python 下沉到 `python/src/specialize.cc`：
+
+```cpp
+// handle_long_type
+if (specialize_value && (val == 1)) {
+    return {constexpr_str, arg};  // type="constexpr", value=1
+}
+```
+
+`AttrsDescriptor` 被移除，对齐特化改为 `BaseBackend.parse_attr("D")` → `[["tt.divisibility", 16]]`。
+
+### 7.3 参数何时被 fold、何时被移除
+
+#### 会被 fold 为 `constexpr`（编译期常量，不进入 MLIR 函数参数）
+
+| 触发条件 | 示例 | 所在代码 |
+|----------|------|----------|
+| 显式 `tl.constexpr` 注解 | `BLOCK: tl.constexpr` | `create_function_from_signature` |
+| 运行时值为 `None` | `mask=None` | `specialize.cc` `Py_IsNone` |
+| 传入 `tl.constexpr` 对象 | `tl.constexpr(128)` | `handle_constexpr_type` |
+| 嵌套 `@jit` 函数 | 子 kernel 引用 | `handle_jit_callable` |
+| **整数隐式特化 `== 1`** | `stride=1` | `handle_long_type` |
+
+#### 不会被 fold，但可能有对齐属性
+
+| 类型 | signature 类型 | 对齐属性 |
+|------|----------------|----------|
+| 普通 int（≠1） | `i32` / `i64` / `u64` | `tt.divisibility=16`（若 `% 16 == 0`） |
+| tensor / pointer | `*fp32` 等 | `tt.divisibility=16`（若 `data_ptr % 16 == 0`） |
+| bool | `u1` | 无 |
+| float | `fp32` | 无 |
+
+#### fold 后在各层的"移除"行为
+
+```
+用户调用 kernel[grid](a, stride=1, N=1024)
+         │
+         ▼
+binder: bound_args = {a, stride, N}          ← 三个参数都在
+specialization = [("*fp32", ""), ("constexpr", 1), ("i32", "D")]
+         │
+         ▼
+_pack_args: constexprs = {(1,): 1}          ← stride=1 被提取
+           signature = {a: "*fp32", stride: "constexpr", N: "i32"}
+         │
+         ▼
+ASTFunction.serialize:                       ← stride 不在 IR 参数列表
+  val_paths = [a, N]  (stride 被 constants 排除)
+         │
+         ▼
+tt.func @kernel(%arg0: !tt.ptr<fp32>, %arg1: i32)  ← 只有两个 MLIR 参数
+         │
+         ▼
+launcher: 仍接收 3 个 Python 参数            ← stride 作为 PyObject 传入但不转发给 CUDA
+```
+
+关键代码：
+
+```python
+# jit.py _pack_args
+constexprs = find_paths_if(sigvals, lambda _, val: val == "constexpr")
+constexprs = {path: get_iterable_path(list(bound_args.values()), path) for path in constexprs}
+
+# code_generator.py ASTFunction.serialize
+is_val = lambda path, _: path not in self.constants and _ is not None
+val_paths = list(find_paths_if(self.arg_types, is_val))  # 排除 constants
+
+# driver.py make_launcher
+elif ty != "constexpr":
+    internal_args_list.append(f"_arg{i}")  # constexpr 不进入 CUDA kernel params
+```
+
+### 7.4 函数签名一致性
+
+| 层级 | stride=1 时 | stride=2 时 | 是否一致 |
+|------|-------------|-------------|----------|
+| Python 用户调用 | `kernel(a, 1, N)` | `kernel(a, 2, N)` | ✓ 签名相同 |
+| `bound_args` 键集合 | `{a, stride, N}` | `{a, stride, N}` | ✓ |
+| `ASTSource.signature` | `{a:"*fp32", stride:"constexpr", N:"i32"}` | `{a:"*fp32", stride:"i32", N:"i32"}` | ✗ 类型不同 |
+| MLIR `tt.func` 参数数 | 2（stride 被 fold） | 3（stride 是运行时 i32） | ✗ |
+| CUDA kernel 实参 | 2 | 3 | ✗ |
+| cache key | 不同 specialization | 不同 specialization | ✗ 分别缓存 |
+
+**要点**：Python 层签名对用户始终一致；但编译产物（IR / cubin）按 specialization 分桶，同一 kernel 函数 `stride=1` 和 `stride=2` 会编译出不同版本。
+
+### 7.5 如何禁用 constant-1 fold
+
+旧 patch（针对 `AttrsDescriptor` / `compute_spec_key`）在 3.6 **无效**。可选方案：
+
+```python
+# 方案 1：装饰器参数（推荐）
+@triton.jit(do_not_specialize=["stride"])
+def kernel(a, stride, N): ...
+
+# 方案 2：按位置
+@triton.jit(do_not_specialize=[1])
+def kernel(a, stride, N): ...
+```
+
+`do_not_specialize` 令 `specialize_value=False`，`handle_long_type` 中 `val == 1` 分支不触发，参数保持为 `i32` 运行时参数。
+
+```python
+# 方案 3：显式 constexpr（主动 fold，而非隐式）
+def kernel(a, stride: tl.constexpr, N): ...
+```
+
+### 7.6 与 ixtriturbo patch 的对应关系
+
+```python
+# ixtriturbo 旧 patch（3.6 之前有效）
+attrs_cls.is_equal_to_1 = staticmethod(lambda x: False)
+triton_jit.compute_spec_key = compute_spec_key_without_equal_to_1
+```
+
+| 旧 patch 行为 | 3.6 等价目标 | 3.6 实现位置 |
+|---------------|-------------|-------------|
+| 禁用 `is_equal_to_1` | 不再有 `tt.equal_to` 属性 | 已默认移除 |
+| 禁用 `compute_spec_key` 的 `"1"` 分支 | 阻止 `val==1` → `constexpr` | `specialize.cc:238-240` |
+| 保留对齐特化 `"D"` | `tt.divisibility=16` | `BaseBackend.parse_attr` |
+
+3.6 等价 patch 应针对 `native_specialize_impl`（或直接用 `do_not_specialize`），而非 `AttrsDescriptor`。

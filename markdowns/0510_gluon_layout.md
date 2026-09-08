@@ -468,6 +468,14 @@ gl.DistributedLinearLayout(
 
 即逻辑索引的位分解：低 5 位 → lane，高 2 位 → warp。适合高维 reshape / 复杂重排；日常 blocked + slice 够用。
 
+也可以不手写 bases，在 `@gluon.jit` 里对已有 layout 调用：
+
+```python
+linear: gl.constexpr = gl.to_linear_layout(blocked, [16, 16])
+```
+
+这会走 C++ `ttg::toLinearLayout`，返回带 shape 补 bit 后的 `DistributedLinearLayout`。**不要**在 kernel 开头把所有 tensor 都改成 linear：部分 API（如 `dot_fma` 的 acc）仍要求 `BlockedLayout`。详见 `0020_linear_layout.md` §8.3。
+
 **本章小结**：layout 影响通信量；Gluon 无唯一规范形，但可用 linear layout 统一理解。
 
 ---
